@@ -1,41 +1,53 @@
-# 忽略 PyCharm 的项目配置文件
+# Ignore PyCharm project configuration files
 .idea/
 
-# 忽略 Python 的编译文件
+# Ignore Python compiled files
 *.pyc
 *.pyo
 *.pyd
 __pycache__/
 
-# 忽略虚拟环境文件夹
+# Ignore virtual environment folders
 venv/
 .env/
 
-# 忽略日志文件
+# Ignore log files
 *.log
 
-# 忽略临时文件
+# Ignore temporary files
 *.swp
 *.swo
 *.bak
 *.tmp
 *.temp
 
-# 忽略 Jupyter Notebook 的检查点文件夹
+# Ignore Jupyter Notebook checkpoint folders
 .ipynb_checkpoints/
 
-# 忽略 Windows 系统生成的文件
+# Ignore Windows system-generated files
 Thumbs.db
 desktop.ini
 
-# 忽略操作系统和编辑器缓存文件
+# Ignore OS and editor cache files
 .DS_Store
 *.class
 *.project
 *.classpath
 
-# 忽略特定工具生成的文件
+# Ignore specific tool-generated files
 *.idea/
 *.iml
 *.iws
 *.ipr
+
+# Git LFS tracked files
+*.png
+*.jpg
+*.zip
+*.tar
+*.gz
+*.mp4
+*.mp3
+
+# Prevent Git LFS-related files from being added to the repository
+*.lfs
