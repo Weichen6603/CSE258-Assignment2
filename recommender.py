@@ -32,6 +32,11 @@ class MovieRecommenderSystem:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
+        self.cold_start_threshold = 5
+        self.warm_up_threshold = 20
+        self.rating_min = 0.5
+        self.rating_max = 5.0
+
     def fit(self, movies_df, ratings_df, tfidf_matrix):
         """
         Train the recommender system
@@ -55,7 +60,8 @@ class MovieRecommenderSystem:
         """
         self.logger.info("Loading SVD++ model...")
         try:
-            self.cf_model = SvdppRecommender.load_model('./model/svdpp_model.pkl')
+            # self.cf_model = SvdppRecommender.load_model('./model/svdpp_model.pkl')
+            self.cf_model = SvdppRecommender.load_model('./model/svdpp_model_enhanced.pkl')
             if self.cf_model is None:
                 raise Exception("Failed to load SVD++ model")
             self.logger.info("SVD++ model loaded successfully")
@@ -103,44 +109,65 @@ class MovieRecommenderSystem:
             self.logger.error(f"Error in content-based prediction: {e}")
             return None
 
+    def clip_rating(self, rating):
+        """
+        确保评分在合法范围内
+        """
+        if rating is None:
+            return None
+        return max(self.rating_min, min(self.rating_max, rating))
+
+    def get_dynamic_weight(self, user_id):
+        """
+        基于用户状态动态计算权重
+        """
+        user_ratings_count = len(self.ratings_df[self.ratings_df['userId'] == user_id])
+
+        if user_ratings_count < self.cold_start_threshold:
+            return 0.2
+        elif user_ratings_count < self.warm_up_threshold:
+            # 线性插值
+            progress = (user_ratings_count - self.cold_start_threshold) / (
+                        self.warm_up_threshold - self.cold_start_threshold)
+            return 0.2 + 0.5 * progress
+        else:
+            return 0.7
+
     def predict_hybrid(self, user_id, movie_id):
         """
-        Make hybrid prediction
+        使用动态权重的混合预测，并确保评分在合法范围内
         """
         try:
-            # Get both predictions
+            alpha = self.get_dynamic_weight(user_id)
+
             cf_pred = self.predict_collaborative(user_id, movie_id)
             cb_pred = self.predict_content_based(movie_id)
 
-            # Handle missing predictions
+            # 处理预测值
             if cf_pred is None:
-                return cb_pred
+                return self.clip_rating(cb_pred)
             if cb_pred is None:
-                return cf_pred
+                return self.clip_rating(cf_pred)
 
-            # Weighted combination
-            return self.cf_weight * cf_pred + (1 - self.cf_weight) * cb_pred
+            # 加权融合并确保在范围内
+            hybrid_pred = alpha * cf_pred + (1 - alpha) * cb_pred
+            return self.clip_rating(hybrid_pred)
+
         except Exception as e:
             self.logger.error(f"Error in hybrid prediction: {e}")
             return None
 
     def evaluate(self, test_size=0.2, random_state=42):
-        """
-        Evaluate model performance
-        """
-        self.logger.info("Starting model evaluation...")
-
-        # Split test data
+        """评估模型性能"""
         _, test_data = train_test_split(
             self.ratings_df,
             test_size=test_size,
             random_state=random_state
         )
 
-        # Evaluate different methods
         methods = {
             'Collaborative Filtering': self.predict_collaborative,
-            'Content Based': self.predict_content_based,
+            'Content Based': lambda u, m: self.predict_content_based(m),  # 修复这里
             'Hybrid': self.predict_hybrid
         }
 
@@ -164,13 +191,9 @@ class MovieRecommenderSystem:
                     'NDCG': ndcg_score(actuals.reshape(1, -1), predictions.reshape(1, -1))
                 }
 
-        self.logger.info("Model evaluation completed")
         return self.evaluation_results
 
     def get_top_n_recommendations(self, user_id, n=10, method='hybrid'):
-        """
-        Generate top-N recommendations for user
-        """
         try:
             # Get user's rated movies
             rated_movies = set(self.ratings_df[
@@ -197,18 +220,18 @@ class MovieRecommenderSystem:
             recommendations = sorted(predictions, key=lambda x: x[1], reverse=True)[:n]
 
             # Get movie details
+            recommended_movies = pd.DataFrame(recommendations, columns=['id', 'predicted_rating'])
+
             recommended_movies = pd.merge(
-                pd.DataFrame(recommendations, columns=['id', 'predicted_rating']),
-                self.movies_df[['id', 'title', 'genres_list']],
+                recommended_movies,
+                self.movies_df[['id', 'original_title', 'genres_list']],
                 on='id'
             )
 
             return recommended_movies
-
         except Exception as e:
             self.logger.error(f"Error in generating recommendations: {e}")
             return None
-
 
 def main():
     """
@@ -252,6 +275,11 @@ def main():
     user_id = ratings_df['userId'].iloc[0]
     recommendations = recommender.get_top_n_recommendations(user_id, n=5)
     if recommendations is not None:
+        # Set pandas options to display all columns and widen the display width
+        pd.set_option('display.max_columns', None)  # Display all columns
+        pd.set_option('display.max_colwidth', None)  # Don't truncate column contents
+        pd.set_option('display.width', 1000)  # Set the display width to a large number
+
         print(f"\nTop 5 recommendations for user {user_id}:")
         print(recommendations)
 

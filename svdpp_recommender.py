@@ -1,460 +1,497 @@
 import os
 import numpy as np
 import pandas as pd
-import pickle
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from sklearn.metrics import mean_squared_error, mean_absolute_error, ndcg_score
 from sklearn.model_selection import train_test_split
 import logging
 from datetime import datetime
 import matplotlib.pyplot as plt
+from tqdm import tqdm
+import torch.multiprocessing as mp
+
+from dataset import MovieRatingDataset
 
 
-class SvdppRecommender:
+class SVDppModel(nn.Module):
+    def __init__(self, n_users, n_items, n_factors, n_features=None):
+        super(SVDppModel, self).__init__()
+        self.n_factors = n_factors
+
+        # 用户和物品嵌入
+        self.user_embeddings = nn.Embedding(n_users, n_factors)
+        self.item_embeddings = nn.Embedding(n_items, n_factors)
+        self.user_implicit_embeddings = nn.Embedding(n_items, n_factors)
+
+        # 偏置项
+        self.user_biases = nn.Embedding(n_users, 1)
+        self.item_biases = nn.Embedding(n_items, 1)
+
+        # 全局偏置
+        self.global_bias = nn.Parameter(torch.zeros(1))
+
+        # 特征层
+        if n_features is not None:
+            self.feature_layer = nn.Sequential(
+                nn.Linear(n_features, n_factors),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(n_factors, n_factors)
+            )
+        else:
+            self.feature_layer = None
+
+        # 初始化参数
+        self._init_weights()
+
+    def _init_weights(self):
+        """使用He初始化"""
+        nn.init.normal_(self.user_embeddings.weight, 0, np.sqrt(2.0 / self.n_factors))
+        nn.init.normal_(self.item_embeddings.weight, 0, np.sqrt(2.0 / self.n_factors))
+        nn.init.normal_(self.user_implicit_embeddings.weight, 0, np.sqrt(2.0 / self.n_factors))
+        nn.init.zeros_(self.user_biases.weight)
+        nn.init.zeros_(self.item_biases.weight)
+
+    def forward(self, user_idx, item_idx, features=None):
+        # 基础SVD++计算
+        user_embed = self.user_embeddings(user_idx)
+        item_embed = self.item_embeddings(item_idx)
+        user_bias = self.user_biases(user_idx).squeeze()
+        item_bias = self.item_biases(item_idx).squeeze()
+
+        # 计算隐式反馈
+        implicit_feedback = torch.mean(self.user_implicit_embeddings(item_idx), dim=0)
+
+        # 基础预测
+        pred = torch.sum(user_embed * item_embed, dim=1)
+        pred = pred + user_bias + item_bias + self.global_bias
+
+        # 如果有特征，添加特征交互
+        if features is not None and self.feature_layer is not None:
+            feature_vectors = self.feature_layer(features)
+            pred = pred + torch.sum(feature_vectors * item_embed, dim=1)
+
+        return pred
+
+
+class GPUSvdppRecommender:
     def __init__(self,
-                 n_factors=150,
-                 n_epochs=50,
-                 learning_rate=0.005,
-                 regularization=0.02,
-                 early_stopping_rounds=5,
-                 min_improvement=0.0001,
-                 learning_rate_decay=0.96,
-                 random_state=42):
-        """
-        Initialize improved SVD++ recommender
-
-        Parameters:
-            n_factors: number of latent factors
-            n_epochs: maximum number of training epochs
-            learning_rate: initial learning rate
-            regularization: regularization parameter
-            early_stopping_rounds: number of rounds for early stopping
-            min_improvement: minimum improvement threshold
-            learning_rate_decay: learning rate decay factor
-            random_state: random seed
-        """
+                 n_factors=100,
+                 n_epochs=1000,
+                 batch_size=2048,
+                 learning_rate=0.001,
+                 weight_decay=0.02,
+                 dropout_rate=0.2,
+                 device='cuda' if torch.cuda.is_available() else 'cpu',
+                 num_workers=4):
+        # 初始化参数
         self.n_factors = n_factors
         self.n_epochs = n_epochs
-        self.initial_learning_rate = learning_rate
+        self.batch_size = batch_size
         self.learning_rate = learning_rate
-        self.regularization = regularization
-        self.early_stopping_rounds = early_stopping_rounds
-        self.min_improvement = min_improvement
-        self.learning_rate_decay = learning_rate_decay
+        self.weight_decay = weight_decay
+        self.dropout_rate = dropout_rate
+        self.device = device
+        self.num_workers = num_workers
 
-        # Set random seed
-        np.random.seed(random_state)
-
-        # Initialize logger
+        # 设置日志
         self._setup_logger()
+        self.logger.info(f"Initializing SVD++ model with {n_factors} factors on {device}")
 
-        # Training history
+        # 模型相关属性
+        self.model = None
+        self.optimizer = None
+        self.criterion = None
+        self.user_mapping = None
+        self.item_mapping = None
+
+        # 训练历史
         self.history = {
-            'train_rmse': [],
-            'val_rmse': [],
-            'learning_rates': []
+            'train_loss': [],
+            'val_metrics': []
         }
 
+        # 创建模型保存目录
+        os.makedirs('model', exist_ok=True)
+        self.logger.info("Model save directory created/verified")
+
+        self.model_dir = 'model'
+        os.makedirs(self.model_dir, exist_ok=True)
+        self.logger.info(f"Model directory created/verified at {self.model_dir}")
+
     def _setup_logger(self):
-        """Setup logger to save logs in the 'log' folder."""
-        # Ensure the log directory exists
+        # 创建logger实例
+        self.logger = logging.getLogger('GPUSVDpp')
+        self.logger.setLevel(logging.INFO)
+
+        # 创建日志目录
         log_dir = 'log'
         os.makedirs(log_dir, exist_ok=True)
 
-        # Set up logger
-        self.logger = logging.getLogger('ImprovedSVDpp')
-        self.logger.setLevel(logging.INFO)
-
-        # Avoid adding duplicate handlers
         if not self.logger.handlers:
-            # Console handler
+            # 1. 控制台处理器
             console_handler = logging.StreamHandler()
             console_handler.setLevel(logging.INFO)
+
+            # 2. 文件处理器
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            log_file = os.path.join(log_dir, f'training_{timestamp}.log')
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setLevel(logging.INFO)
+
+            # 日志格式
             formatter = logging.Formatter(
                 '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
             )
             console_handler.setFormatter(formatter)
-            self.logger.addHandler(console_handler)
-
-            # File handler
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            log_file = os.path.join(log_dir, f'svdpp_training_{timestamp}.log')
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setLevel(logging.INFO)
             file_handler.setFormatter(formatter)
+
+            # 添加处理器
+            self.logger.addHandler(console_handler)
             self.logger.addHandler(file_handler)
 
-        self.logger.info("Logger initialized successfully!")
+    def fit(self, ratings_df, validation_size=0.1, features_df=None,
+            patience=10, min_improvement=0.0001):
+        """增强的训练函数，包含多指标早停"""
+        self.logger.info(f"Training on {self.device}")
 
-    def save_model(self, file_path):
-        """
-        Save model to a file using pickle.
+        # 创建用户和物品映射
+        self.user_mapping = {user: idx for idx, user
+                             in enumerate(ratings_df['userId'].unique())}
+        self.item_mapping = {item: idx for idx, item
+                             in enumerate(ratings_df['movieId'].unique())}
 
-        Parameters:
-            file_path: path to save the model.
-        """
-        try:
-            with open(file_path, 'wb') as file:
-                pickle.dump(self, file)
-            self.logger.info(f"Model saved successfully to {file_path}")
-        except Exception as e:
-            self.logger.error(f"Error saving model: {e}")
-
-    @staticmethod
-    def load_model(file_path):
-        """
-        Load model from a file using pickle.
-
-        Parameters:
-            file_path: path to load the model from.
-
-        Returns:
-            Loaded SvdppRecommender instance.
-        """
-        try:
-            with open(file_path, 'rb') as file:
-                model = pickle.load(file)
-            logging.info(f"Model loaded successfully from {file_path}")
-            return model
-        except Exception as e:
-            logging.error(f"Error loading model: {e}")
-            return None
-
-
-    def _init_model_parameters(self, n_users, n_items):
-        """Initialize model parameters using He initialization"""
-        self.user_factors = np.random.normal(0, np.sqrt(2.0 / self.n_factors),
-                                             (n_users, self.n_factors))
-        self.item_factors = np.random.normal(0, np.sqrt(2.0 / self.n_factors),
-                                             (n_items, self.n_factors))
-
-        self.user_biases = np.zeros(n_users)
-        self.item_biases = np.zeros(n_items)
-
-        self.user_implicit_factors = np.random.normal(0, np.sqrt(2.0 / self.n_factors),
-                                                      (n_items, self.n_factors))
-
-    def fit(self, ratings_df, validation_size=0.1, verbose=True):
-        """
-        Train the model
-
-        Parameters:
-            ratings_df: ratings DataFrame
-            validation_size: proportion of data for validation
-            verbose: whether to print progress information
-        """
-        self.logger.info("Starting improved SVD++ model training...")
-
-        # Create user and item mappings
-        self.user_mapping = {user: idx for idx, user in
-                             enumerate(ratings_df['userId'].unique())}
-        self.item_mapping = {item: idx for idx, item in
-                             enumerate(ratings_df['movieId'].unique())}
-
-        n_users = len(self.user_mapping)
-        n_items = len(self.item_mapping)
-
-        # Initialize model parameters
-        self._init_model_parameters(n_users, n_items)
-
-        # Calculate global mean
-        self.global_mean = ratings_df['rating'].mean()
-
-        # Split training and validation data
+        # 划分训练和验证数据
         train_data, val_data = train_test_split(
-            ratings_df,
-            test_size=validation_size,
-            random_state=42
+            ratings_df, test_size=validation_size, random_state=42
         )
 
-        # Create user rating history dictionary
-        self.user_rated_items = self._create_user_rated_items(train_data)
+        # 创建数据集和数据加载器
+        train_dataset = MovieRatingDataset(
+            train_data, self.user_mapping, self.item_mapping, features_df
+        )
+        val_dataset = MovieRatingDataset(
+            val_data, self.user_mapping, self.item_mapping, features_df
+        )
 
-        # Training loop
-        best_val_rmse = float('inf')
-        no_improvement_count = 0
+        # 指定多进程上下文
+        multiprocessing_context = mp.get_context('spawn')
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            multiprocessing_context=multiprocessing_context
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            multiprocessing_context=multiprocessing_context
+        )
+
+        # 初始化模型
+        n_features = features_df.shape[1] if features_df is not None else None
+        self.model = SVDppModel(
+            len(self.user_mapping),
+            len(self.item_mapping),
+            self.n_factors,
+            n_features
+        ).to(self.device)
+
+        # 初始化优化器和损失函数
+        self.optimizer = optim.Adam(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        self.criterion = nn.MSELoss()
+
+        # 初始化早停变量
+        best_metrics = {
+            'rmse': float('inf'),
+            'mae': float('inf'),
+            'ndcg': 0
+        }
+        patience_counter = 0
         best_epoch = 0
 
+        # 训练循环
         for epoch in range(self.n_epochs):
-            # Train one epoch
-            train_rmse = self._train_epoch(train_data)
+            train_loss = self._train_epoch(train_loader)
+            val_metrics = self._validate(val_loader)
 
-            # Evaluate on validation set
-            val_rmse = self._calculate_validation_rmse(val_data)
+            self.history['train_loss'].append(train_loss)
+            self.history['val_metrics'].append(val_metrics)
 
-            # Record history
-            self.history['train_rmse'].append(train_rmse)
-            self.history['val_rmse'].append(val_rmse)
-            self.history['learning_rates'].append(self.learning_rate)
+            self.logger.info(
+                f'Epoch {epoch + 1}/{self.n_epochs}: '
+                f'Train RMSE = {train_loss:.4f}, '
+                f'Val RMSE = {val_metrics["rmse"]:.4f}, '
+                f'Val MAE = {val_metrics["mae"]:.4f}, '
+                f'Val NDCG = {val_metrics["ndcg"]:.4f}'
+            )
 
-            if verbose:
-                self.logger.info(
-                    f"Epoch {epoch + 1}/{self.n_epochs} - "
-                    f"Train RMSE: {train_rmse:.4f}, "
-                    f"Val RMSE: {val_rmse:.4f}, "
-                    f"LR: {self.learning_rate:.6f}"
-                )
+            # 检查是否有改进
+            improved = False
+            if (val_metrics['rmse'] < best_metrics['rmse'] - min_improvement or
+                    val_metrics['mae'] < best_metrics['mae'] - min_improvement or
+                    val_metrics['ndcg'] > best_metrics['ndcg'] + min_improvement):
 
-            # Early stopping check
-            if val_rmse < best_val_rmse - self.min_improvement:
-                best_val_rmse = val_rmse
+                improved = True
+                best_metrics = val_metrics.copy()
                 best_epoch = epoch
-                no_improvement_count = 0
+                patience_counter = 0
+
+                # 保存最佳模型
+                self.save_model('best_model.pt')
+                self.logger.info("New best model saved!")
             else:
-                no_improvement_count += 1
+                patience_counter += 1
 
-            # Learning rate decay
-            self.learning_rate *= self.learning_rate_decay
-
-            # Early stopping
-            if no_improvement_count >= self.early_stopping_rounds:
+            # 早停检查
+            if patience_counter >= patience:
                 self.logger.info(
-                    f"Early stopping triggered at epoch {epoch + 1}. "
-                    f"Best epoch was {best_epoch + 1}"
+                    f"Early stopping triggered after {epoch + 1} epochs. "
+                    f"Best epoch was {best_epoch + 1} with metrics: "
+                    f"RMSE = {best_metrics['rmse']:.4f}, "
+                    f"MAE = {best_metrics['mae']:.4f}, "
+                    f"NDCG = {best_metrics['ndcg']:.4f}"
                 )
                 break
 
-        self.logger.info("Model training completed!")
+        # 加载最佳模型
+        self.load_model('best_model.pt')
         return self
 
-    def _create_user_rated_items(self, ratings_df):
-        """Create user rating history dictionary"""
-        user_rated_items = {}
-        for user, group in ratings_df.groupby('userId'):
-            if user in self.user_mapping:
-                user_idx = self.user_mapping[user]
-                user_rated_items[user_idx] = [
-                    self.item_mapping[item]
-                    for item in group['movieId']
-                    if item in self.item_mapping
-                ]
-        return user_rated_items
+    def _train_epoch(self, train_loader):
+        """Train for one epoch"""
+        self.model.train()
+        total_loss = 0
+        total_batches = 0
 
-    def _train_epoch(self, train_data):
-        """Train one epoch"""
-        epoch_loss = []
+        pbar = tqdm(train_loader, desc='Training', leave=False)
+        for batch in pbar:
+            self.optimizer.zero_grad()
 
-        train_data = train_data.sample(frac=1).reset_index(drop=True)
+            user_idx = batch['user_idx'].to(self.device)
+            item_idx = batch['item_idx'].to(self.device)
+            ratings = batch['rating'].to(self.device)
 
-        for _, row in train_data.iterrows():
-            if row['userId'] in self.user_mapping and \
-                    row['movieId'] in self.item_mapping:
-                user_idx = self.user_mapping[row['userId']]
-                item_idx = self.item_mapping[row['movieId']]
-                rating = row['rating']
+            features = None
+            if 'features' in batch:
+                features = batch['features'].to(self.device)
 
-                pred = self._predict_one(user_idx, item_idx)
-                error = rating - pred
-                epoch_loss.append(error ** 2)
+            predictions = self.model(user_idx, item_idx, features)
+            loss = self.criterion(predictions, ratings)
 
-                self._update_parameters(user_idx, item_idx, error)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
 
-        return np.sqrt(np.mean(epoch_loss))
+            total_loss += loss.item()
+            total_batches += 1
 
-    def _predict_one(self, user_idx, item_idx):
-        """Predict single rating"""
-        baseline = self.global_mean + \
-                   self.user_biases[user_idx] + \
-                   self.item_biases[item_idx]
+            # Update progress bar
+            pbar.set_postfix({
+                'batch_loss': loss.item(),
+                'avg_loss': total_loss / total_batches
+            })
 
-        user_item_interaction = np.dot(
-            self.user_factors[user_idx],
-            self.item_factors[item_idx]
-        )
+        return np.sqrt(total_loss / total_batches)
 
-        rated_items = self.user_rated_items.get(user_idx, [])
-        if rated_items:
-            implicit_feedback = np.sum(self.user_implicit_factors[rated_items], axis=0)
-            implicit_feedback /= np.sqrt(len(rated_items))
-            implicit_term = np.dot(implicit_feedback, self.item_factors[item_idx])
-        else:
-            implicit_term = 0
+    def _validate(self, val_loader):
+        """Validate and compute multiple metrics"""
+        self.model.eval()
+        total_loss = 0
+        total_batches = 0
+        all_predictions = []
+        all_ratings = []
 
-        return baseline + user_item_interaction + implicit_term
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc='Validating', leave=False):
+                user_idx = batch['user_idx'].to(self.device)
+                item_idx = batch['item_idx'].to(self.device)
+                ratings = batch['rating'].to(self.device)
 
-    def _update_parameters(self, user_idx, item_idx, error):
-        """Update model parameters"""
-        # Update biases
-        self.user_biases[user_idx] += self.learning_rate * \
-                                      (error - self.regularization * self.user_biases[user_idx])
-        self.item_biases[item_idx] += self.learning_rate * \
-                                      (error - self.regularization * self.item_biases[item_idx])
+                features = None
+                if 'features' in batch:
+                    features = batch['features'].to(self.device)
 
-        # Update factors
-        user_factors = self.user_factors[user_idx]
-        item_factors = self.item_factors[item_idx]
+                predictions = self.model(user_idx, item_idx, features)
+                loss = self.criterion(predictions, ratings)
 
-        user_factors_grad = error * item_factors - \
-                            self.regularization * user_factors
-        item_factors_grad = error * user_factors - \
-                            self.regularization * item_factors
+                total_loss += loss.item()
+                total_batches += 1
 
-        self.user_factors[user_idx] += self.learning_rate * user_factors_grad
-        self.item_factors[item_idx] += self.learning_rate * item_factors_grad
+                all_predictions.extend(predictions.cpu().numpy())
+                all_ratings.extend(ratings.cpu().numpy())
 
-        # Update implicit feedback factors
-        rated_items = self.user_rated_items.get(user_idx, [])
-        if rated_items:
-            sqrt_rated = 1.0 / np.sqrt(len(rated_items))
-            for rated_item in rated_items:
-                implicit_grad = sqrt_rated * (error * item_factors - \
-                                              self.regularization * \
-                                              self.user_implicit_factors[rated_item])
-                self.user_implicit_factors[rated_item] += \
-                    self.learning_rate * implicit_grad
+        # Convert to numpy arrays
+        all_predictions = np.array(all_predictions)
+        all_ratings = np.array(all_ratings)
 
-    def _calculate_validation_rmse(self, val_data):
-        """Calculate validation RMSE"""
-        predictions = []
-        actuals = []
+        # Compute multiple metrics
+        metrics = {
+            'rmse': np.sqrt(total_loss / total_batches),
+            'mae': mean_absolute_error(all_ratings, all_predictions),
+            'ndcg': ndcg_score(
+                all_ratings.reshape(1, -1),
+                all_predictions.reshape(1, -1)
+            )
+        }
 
-        for _, row in val_data.iterrows():
-            if row['userId'] in self.user_mapping and \
-                    row['movieId'] in self.item_mapping:
-                user_idx = self.user_mapping[row['userId']]
-                item_idx = self.item_mapping[row['movieId']]
-                pred = self._predict_one(user_idx, item_idx)
-                predictions.append(pred)
-                actuals.append(row['rating'])
+        return metrics
 
-        return np.sqrt(mean_squared_error(actuals, predictions))
+    def get_model_path(self, filename):
+        """
+        Get full path for model file in the model directory
+        """
+        return os.path.join(self.model_dir, filename)
 
-    def predict(self, user_id, movie_id):
-        """Predict rating for specific user and movie"""
-        if user_id not in self.user_mapping or \
-                movie_id not in self.item_mapping:
-            return self.global_mean
+    def save_model(self, filename):
+        """
+        Save model state, mappings and training history to model directory
 
-        user_idx = self.user_mapping[user_id]
-        item_idx = self.item_mapping[movie_id]
-
-        return self._predict_one(user_idx, item_idx)
-
-    def get_recommendations(self, user_id, n=10):
-        """Generate recommendations for user"""
+        Args:
+            filename: Name of the model file (e.g., 'best_model.pt')
+        """
         try:
-            if user_id not in self.user_mapping:
-                self.logger.warning(f"User {user_id} not found in mapping")
-                return []
+            # Ensure we're saving to the model directory
+            path = self.get_model_path(filename)
 
-            user_idx = self.user_mapping[user_id]
-            predictions = []
+            checkpoint = {
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'user_mapping': self.user_mapping,
+                'item_mapping': self.item_mapping,
+                'history': self.history,
+                'model_config': {
+                    'n_factors': self.n_factors,
+                    'dropout_rate': self.dropout_rate
+                }
+            }
 
-            # 获取用户已评分的电影
-            rated_movies = self.user_rated_items.get(user_idx, [])
-
-            # 为所有未评分的电影生成预测
-            for movie_id, item_idx in self.item_mapping.items():
-                if item_idx not in rated_movies:  # 修改这里的判断条件
-                    pred_rating = self._predict_one(user_idx, item_idx)
-                    predictions.append((movie_id, pred_rating))
-
-            # 排序并返回top-N推荐
-            recommendations = sorted(predictions, key=lambda x: x[1], reverse=True)[:n]
-            return recommendations
+            torch.save(checkpoint, path)
+            self.logger.info(f"Model saved successfully to {path}")
 
         except Exception as e:
-            self.logger.error(f"Error in generating recommendations: {e}")
-            return []
+            self.logger.error(f"Error saving model: {e}")
+            raise
+
+    def load_model(self, filename):
+        """
+        Load saved model state and mappings from model directory
+
+        Args:
+            filename: Name of the model file (e.g., 'best_model.pt')
+        """
+        try:
+            path = self.get_model_path(filename)
+
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Model file not found: {path}")
+
+            checkpoint = torch.load(path, map_location=self.device)
+
+            # Load model configuration and reinitialize if needed
+            if self.model is None:
+                model_config = checkpoint['model_config']
+                self.n_factors = model_config['n_factors']
+                self.dropout_rate = model_config['dropout_rate']
+                # Model will be reinitialized in fit() method
+
+            # Load state dictionaries
+            if self.model is not None:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            if self.optimizer is not None:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+            # Load mappings and history
+            self.user_mapping = checkpoint['user_mapping']
+            self.item_mapping = checkpoint['item_mapping']
+            self.history = checkpoint['history']
+
+            self.logger.info(f"Model loaded successfully from {path}")
+
+        except Exception as e:
+            self.logger.error(f"Error loading model: {e}")
+            raise
 
     def plot_training_history(self):
-        """Plot training history"""
-        plt.figure(figsize=(12, 4))
+        """Plot training metrics history"""
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
 
-        plt.subplot(1, 2, 1)
-        plt.plot(self.history['train_rmse'], label='Train RMSE')
-        plt.plot(self.history['val_rmse'], label='Validation RMSE')
-        plt.xlabel('Epoch')
-        plt.ylabel('RMSE')
-        plt.title('RMSE vs. Epoch')
-        plt.legend()
+        # Plot RMSE
+        ax1.plot([m['rmse'] for m in self.history['val_metrics']], label='Validation')
+        ax1.plot(self.history['train_loss'], label='Train')
+        ax1.set_title('RMSE vs. Epoch')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('RMSE')
+        ax1.legend()
+        ax1.grid(True)
 
-        plt.subplot(1, 2, 2)
-        plt.plot(self.history['learning_rates'])
-        plt.xlabel('Epoch')
-        plt.ylabel('Learning Rate')
-        plt.title('Learning Rate Decay')
+        # Plot MAE
+        ax2.plot([m['mae'] for m in self.history['val_metrics']])
+        ax2.set_title('MAE vs. Epoch')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('MAE')
+        ax2.grid(True)
+
+        # Plot NDCG
+        ax3.plot([m['ndcg'] for m in self.history['val_metrics']])
+        ax3.set_title('NDCG vs. Epoch')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('NDCG')
+        ax3.grid(True)
 
         plt.tight_layout()
-        plt.show()
 
-
-class SVDppEvaluator:
-    def __init__(self):
-        self.logger = logging.getLogger('SVDppEvaluator')
-        self.logger.setLevel(logging.INFO)
-
-    def evaluate(self, model, test_data):
-        """Evaluate model performance"""
-        predictions = []
-        actuals = []
-
-        for _, row in test_data.iterrows():
-            pred = model.predict(row['userId'], row['movieId'])
-            if pred is not None:
-                predictions.append(pred)
-                actuals.append(row['rating'])
-
-        predictions = np.array(predictions)
-        actuals = np.array(actuals)
-
-        return {
-            'RMSE': np.sqrt(mean_squared_error(actuals, predictions)),
-            'MAE': mean_absolute_error(actuals, predictions),
-            'NDCG': ndcg_score(actuals.reshape(1, -1), predictions.reshape(1, -1))
-        }
+        # Save the plot
+        plot_path = os.path.join('log', f'training_history_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(plot_path)
+        plt.close()
 
 
 def main():
-    """Main function for example usage"""
-    # Load data
-    ratings_df = pd.read_csv('./dataset/ratings_small.csv')
+    # 加载数据
+    # ratings_df = pd.read_csv('./dataset/ratings_small.csv')
+    ratings_df = pd.read_csv('./dataset/ratings.csv')
 
-    # Split train and test data
-    train_data, test_data = train_test_split(
-        ratings_df, test_size=0.2, random_state=42
+    # 初始化推荐器
+    recommender = GPUSvdppRecommender(
+        n_factors=100,
+        n_epochs=1000,
+        batch_size=4096,
+        learning_rate=0.001,
+        weight_decay=0.02,
+        num_workers=2
     )
 
-    # Initialize and train model
-    model = SvdppRecommender(
-        n_factors=150,
-        n_epochs=50,
-        learning_rate=0.005,
-        regularization=0.02,
-        early_stopping_rounds=5,
-        min_improvement=0.0001,
-        learning_rate_decay=0.96
+    # 训练模型
+    recommender.fit(
+        ratings_df,
+        validation_size=0.1,
+        patience=10,
+        min_improvement=0.0001
     )
 
-    # Train model
-    model.fit(train_data, validation_size=0.1, verbose=True)
+    # 绘制训练历史
+    recommender.plot_training_history()
 
-    # Save the trained model
-    model.save_model('./model/svdpp_model.pkl')
-
-    # Load the model back
-    loaded_model = SvdppRecommender.load_model('svdpp_model.pkl')
-
-    # Verify loaded model
-    if loaded_model:
-        # Plot training history
-        loaded_model.plot_training_history()
-
-        # Evaluate model
-        evaluator = SVDppEvaluator()
-        metrics = evaluator.evaluate(loaded_model, test_data)
-
-        print("\nModel Evaluation Results:")
-        for metric_name, value in metrics.items():
-            print(f"{metric_name}: {value:.4f}")
-
-        # Generate recommendations for sample user
-        sample_user = ratings_df['userId'].iloc[0]
-        recommendations = loaded_model.get_recommendations(sample_user, n=5)
-
-        print(f"\nTop 5 recommendations for user {sample_user}:")
-        for movie_id, pred_rating in recommendations:
-            print(f"Movie ID: {movie_id}, Predicted Rating: {pred_rating:.2f}")
+    # 评估最终模型
+    print("\nBest Model Metrics:")
+    for metric, value in recommender.history['val_metrics'][-1].items():
+        print(f"{metric.upper()}: {value:.4f}")
 
 
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     main()
