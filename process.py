@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -51,11 +52,13 @@ class MovieDataPreprocessor:
         numeric_columns = ['budget', 'revenue', 'runtime', 'popularity']
         for col in numeric_columns:
             self.movies_df[col] = pd.to_numeric(self.movies_df[col], errors='coerce')
+            # 使用中位数填充缺失值
+            self.movies_df[col] = self.movies_df[col].fillna(self.movies_df[col].median())
 
-        # 移除预算或收入为0的异常值
+        # 处理异常值
         self.movies_df = self.movies_df[
-            (self.movies_df['budget'] > 0) &
-            (self.movies_df['revenue'] > 0)
+            (self.movies_df['budget'] > 1000) &  # 预算至少1000美元
+            (self.movies_df['revenue'] >= 0)  # 收入非负
             ]
 
         # 处理日期
@@ -69,9 +72,17 @@ class MovieDataPreprocessor:
         self.movies_df['release_month'] = self.movies_df['release_date'].dt.month
         self.movies_df['release_day'] = self.movies_df['release_date'].dt.day
 
-        # 计算财务指标
-        self.movies_df['roi'] = (self.movies_df['revenue'] - self.movies_df['budget']) / self.movies_df['budget']
+        # 安全计算财务指标
+        self.movies_df['roi'] = np.where(
+            self.movies_df['budget'] > 0,
+            (self.movies_df['revenue'] - self.movies_df['budget']) / self.movies_df['budget'],
+            0
+        )
         self.movies_df['profit'] = self.movies_df['revenue'] - self.movies_df['budget']
+
+        # 裁剪异常ROI值
+        roi_percentile = np.percentile(self.movies_df['roi'], 95)
+        self.movies_df.loc[self.movies_df['roi'] > roi_percentile, 'roi'] = roi_percentile
 
     def process_json_features(self):
         """处理JSON格式的特征"""
